@@ -39,11 +39,16 @@ DF_PATH = os.path.join(BASE_DIR, "df.pkl")
 INDICES_PATH = os.path.join(BASE_DIR, "indices.pkl")
 TFIDF_MATRIX_PATH = os.path.join(BASE_DIR, "tfidf_matrix.pkl")
 TFIDF_PATH = os.path.join(BASE_DIR, "tfidf.pkl")
+KMEANS_PATH = os.path.join(BASE_DIR, "kmeans_model.pkl")
+KNN_PATH = os.path.join(BASE_DIR, "knn_model.pkl")
 
 df: Optional[pd.DataFrame] = None
 indices_obj: Any = None
 tfidf_matrix: Any = None
 tfidf_obj: Any = None
+kmeans_obj: Any = None  # trained sklearn KMeans
+knn_obj: Any = None  # trained sklearn NearestNeighbors (cosine, brute)
+CLUSTER_LABELS: Optional[np.ndarray] = None  # K-Means cluster id per row of df
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
 
 # Shared HTTP client (created once at startup)
@@ -56,12 +61,16 @@ CACHE_MAX_ITEMS = 500  # stale entries are kept as fallback, up to this many
 
 MAX_RETRIES = 3
 
+# Recommender: how many nearest neighbours KNN fetches before the cluster filter is applied
+CANDIDATE_POOL = 1000
+
 
 # =========================
 # LIFESPAN (startup / shutdown)
 # =========================
 def load_pickles():
     global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
+    global kmeans_obj, knn_obj, CLUSTER_LABELS
 
     with open(DF_PATH, "rb") as f:
         df = pickle.load(f)
@@ -75,9 +84,27 @@ def load_pickles():
     with open(TFIDF_PATH, "rb") as f:
         tfidf_obj = pickle.load(f)
 
+    with open(KMEANS_PATH, "rb") as f:
+        kmeans_obj = pickle.load(f)
+
+    with open(KNN_PATH, "rb") as f:
+        knn_obj = pickle.load(f)
+
     if df is None or "title" not in df.columns:
         raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
 
+    if "cluster" not in df.columns:
+        raise RuntimeError(
+            "df.pkl has no 'cluster' column. Re-run movies.ipynb to regenerate the models."
+        )
+
+    if not (len(df) == tfidf_matrix.shape[0] == len(kmeans_obj.labels_)):
+        raise RuntimeError(
+            "df.pkl, tfidf_matrix.pkl and kmeans_model.pkl have different sizes. "
+            "They must all come from the same run of movies.ipynb."
+        )
+
+    CLUSTER_LABELS = df["cluster"].to_numpy()
     TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
 
 
@@ -92,7 +119,10 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
         headers={"Accept": "application/json"},
     )
-    logger.info("Startup complete: pickles loaded, HTTP client ready")
+    logger.info(
+        "Startup complete: TF-IDF + K-Means (K=%d) + KNN loaded, HTTP client ready",
+        int(kmeans_obj.n_clusters),
+    )
 
     yield
 
@@ -104,7 +134,7 @@ async def lifespan(app: FastAPI):
 # =========================
 # FASTAPI APP
 # =========================
-app = FastAPI(title="Movie Recommender API", version="3.1", lifespan=lifespan)
+app = FastAPI(title="Movie Recommender API", version="4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,8 +167,10 @@ class TMDBMovieDetails(BaseModel):
 
 
 class TFIDFRecItem(BaseModel):
+    # Name kept for frontend compatibility; items now come from K-Means + KNN.
     title: str
     score: float
+    cluster: Optional[int] = None
     tmdb: Optional[TMDBMovieCard] = None
 
 
@@ -147,6 +179,8 @@ class SearchBundleResponse(BaseModel):
     movie_details: TMDBMovieDetails
     tfidf_recommendations: List[TFIDFRecItem]
     genre_recommendations: List[TMDBMovieCard]
+    query_cluster: Optional[int] = None
+    recommendation_method: str = "kmeans+knn"
 
 
 # =========================
@@ -348,6 +382,55 @@ def tfidf_recommend_titles(
     return out
 
 
+def ml_recommend_titles(
+    query_title: str, top_n: int = 10, pool: int = CANDIDATE_POOL
+) -> Tuple[int, List[Tuple[str, float, int]]]:
+    """
+    K-Means + KNN recommender (the trained-model pipeline):
+
+      1. find the K-Means cluster of the selected movie
+      2. ask the saved KNN model (cosine, brute) for its nearest `pool` movies
+      3. keep only neighbours from the same cluster, ordered by cosine distance
+      4. return the top_n; if the cluster is too small, top up with the nearest
+         movies from other clusters so the caller always gets top_n results
+
+    Returns (query_cluster, [(title, cosine_similarity, cluster_id), ...]).
+    """
+    if (
+        df is None
+        or tfidf_matrix is None
+        or knn_obj is None
+        or CLUSTER_LABELS is None
+    ):
+        raise HTTPException(status_code=500, detail="ML models not loaded")
+
+    idx = get_local_idx_by_title(query_title)
+    n_docs = tfidf_matrix.shape[0]
+    pool = max(1, min(pool, n_docs - 1))
+
+    dist, ind = knn_obj.kneighbors(tfidf_matrix[idx], n_neighbors=pool + 1)
+    ind, dist = ind[0], dist[0]
+
+    keep = ind != idx  # never recommend the selected movie itself
+    ind, dist = ind[keep], dist[keep]
+
+    query_cluster = int(CLUSTER_LABELS[idx])
+    same_cluster = CLUSTER_LABELS[ind] == query_cluster
+
+    chosen = list(np.flatnonzero(same_cluster)[:top_n])
+    if len(chosen) < top_n:
+        others = np.flatnonzero(~same_cluster)
+        chosen += list(others[: top_n - len(chosen)])
+
+    out: List[Tuple[str, float, int]] = []
+    for p in chosen:
+        row = int(ind[p])
+        out.append(
+            (str(df.iloc[row]["title"]), float(1.0 - dist[p]), int(CLUSTER_LABELS[row]))
+        )
+    return query_cluster, out
+
+
 async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
     """
     Uses TMDB search by title to fetch poster for a local title.
@@ -450,7 +533,39 @@ async def recommend_genre(
     return [c for c in cards if c.tmdb_id != tmdb_id]
 
 
-# ---------- TF-IDF ONLY (debug/useful) ----------
+# ---------- K-MEANS + KNN (trained ML models) ----------
+@app.get("/recommend/ml")
+async def recommend_ml(
+    title: str = Query(..., min_length=1),
+    top_n: int = Query(10, ge=1, le=50),
+):
+    """Selected movie -> its K-Means cluster -> KNN ranking inside that cluster."""
+    cluster, recs = ml_recommend_titles(title, top_n=top_n)
+    return {
+        "query": title,
+        "cluster": cluster,
+        "method": "kmeans+knn",
+        "recommendations": [
+            {"title": t, "score": s, "cluster": c} for t, s, c in recs
+        ],
+    }
+
+
+# ---------- MODEL INFO (handy for the viva demo) ----------
+@app.get("/model/info")
+def model_info():
+    sizes = df["cluster"].value_counts().sort_index()
+    return {
+        "n_movies": int(len(df)),
+        "tfidf_features": int(tfidf_matrix.shape[1]),
+        "kmeans_k": int(kmeans_obj.n_clusters),
+        "knn_metric": str(knn_obj.metric),
+        "knn_algorithm": str(knn_obj.algorithm),
+        "cluster_sizes": {int(k): int(v) for k, v in sizes.items()},
+    }
+
+
+# ---------- COSINE BASELINE (TF-IDF only, no trained model) ----------
 @app.get("/recommend/tfidf")
 async def recommend_tfidf(
     title: str = Query(..., min_length=1),
@@ -470,7 +585,7 @@ async def search_bundle(
     """
     Selects the BEST TMDB match for the query and returns:
       - movie details
-      - TF-IDF recommendations (local) + posters
+      - K-Means + KNN recommendations (local) + posters
       - Genre recommendations (TMDB) + posters
     For MULTIPLE matches, use /tmdb/search.
     """
@@ -483,15 +598,15 @@ async def search_bundle(
     tmdb_id = int(best["id"])
     details = await tmdb_movie_details(tmdb_id)
 
-    # 1) TF-IDF recommendations (never crash endpoint)
-    recs: List[Tuple[str, float]] = []
-    try:
-        recs = tfidf_recommend_titles(details.title, top_n=tfidf_top_n)
-    except Exception:
+    # 1) K-Means + KNN recommendations (never crash endpoint)
+    recs: List[Tuple[str, float, int]] = []
+    query_cluster: Optional[int] = None
+    for name in (details.title, query):
         try:
-            recs = tfidf_recommend_titles(query, top_n=tfidf_top_n)
+            query_cluster, recs = ml_recommend_titles(name, top_n=tfidf_top_n)
+            break
         except Exception:
-            recs = []
+            continue
 
     # Fetch posters concurrently, but limit parallelism to be gentle on TMDB
     sem = asyncio.Semaphore(5)
@@ -500,11 +615,11 @@ async def search_bundle(
         async with sem:
             return await attach_tmdb_card_by_title(title)
 
-    cards_for_recs = await asyncio.gather(*[_card(t) for t, _ in recs])
+    cards_for_recs = await asyncio.gather(*[_card(t) for t, _, _ in recs])
 
     tfidf_items: List[TFIDFRecItem] = [
-        TFIDFRecItem(title=t, score=s, tmdb=card)
-        for (t, s), card in zip(recs, cards_for_recs)
+        TFIDFRecItem(title=t, score=s, cluster=c, tmdb=card)
+        for (t, s, c), card in zip(recs, cards_for_recs)
     ]
 
     # 2) Genre recommendations (TMDB discover by first genre)
@@ -530,4 +645,5 @@ async def search_bundle(
         movie_details=details,
         tfidf_recommendations=tfidf_items,
         genre_recommendations=genre_recs,
+        query_cluster=query_cluster,
     )

@@ -47,3 +47,25 @@ Open the Vite URL shown in the terminal, normally:
 - `GET /recommend/tfidf?title=...`
 
 The `/movie/search` endpoint is used when a movie is opened. It returns the selected movie, TF-IDF recommendations and genre recommendations.
+
+
+Requirements · TXT
+# --- API (main.py) ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+python-dotenv>=1.0
+pydantic>=2.6
+ 
+# --- ML / notebook (movies.ipynb) ---
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+scikit-learn>=1.4
+matplotlib>=3.8
+seaborn>=0.13
+nltk>=3.8
+ipykernel>=6.29
+jupyter>=1.0
+ 
+
